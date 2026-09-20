@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
+import json
 from collections.abc import Callable, Sequence
 from typing import Any, Literal, TypeAlias
 
@@ -9,7 +11,7 @@ from openai.types.responses.response import ToolChoice as ResponsesToolChoice
 from openai.types.responses.tool import Tool as ResponsesTool
 from openai.types.responses.tool_choice_allowed import ToolChoiceAllowed
 from openai.types.responses.tool_choice_function import ToolChoiceFunction
-from xgrammar import StructuralTag, normalize_tool_choice
+from xgrammar import Grammar, StructuralTag, normalize_tool_choice
 from xgrammar import get_model_structural_tag as get_xgrammar_model_structural_tag
 from xgrammar.openai_tool_call_schema import (
     BuiltinToolParam,
@@ -34,6 +36,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
 )
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 ToolChoice: TypeAlias = (
     Literal["none", "auto", "required"]
@@ -609,135 +614,82 @@ def get_kimi_k3_structural_tag(
 
 
 # ---------------------------------------------------------------------------
-# Gemma4 (native ``<|tool_call>call:...`` format). Klang patch, not upstream.
+# Gemma4 (native ``<|tool_call>call:...`` format)
 # ---------------------------------------------------------------------------
 # Gemma4 assistant tool calls (see ``vllm/parser/gemma4.py``):
 #   <|tool_call>call:NAME{key:<|"|>string val<|"|>,count:42,flag:true}<tool_call|>
-# Multiple calls are emitted back-to-back with no separator. Strings are
-# wrapped in the ``<|"|>`` delimiter token and emitted raw; numbers, booleans
-# and null are emitted bare. The argument block is NOT JSON, so
-# JSONSchemaFormat cannot express it.
+# Multiple calls are emitted back-to-back with no separator. The argument block
+# is JSON-shaped but not JSON: keys are bare and string values are wrapped in
+# the ``<|"|>`` delimiter token and emitted raw, without escapes. The Klang
+# xgrammar fork expresses that shape as the ``gemma`` JSON-schema style, so the
+# tool's parameters schema constrains the whole block, its braces included.
 _GEMMA4_TOOL_CALL_START = "<|tool_call>"
 _GEMMA4_TOOL_CALL_END = "<tool_call|>"
-_GEMMA4_STRING_DELIM = '<|"|>'
 # The proper post-call terminator. Some checkpoints emit EOS directly
 # instead, so the trailer is optional.
 _GEMMA4_TOOL_RESPONSE = "<|tool_response>"
-
-_GEMMA4_SCALAR_VALUE_FORMATS: dict[str, Callable[[], Any]] = {
-    "integer": lambda: RegexFormat(pattern=r"-?[0-9]+"),
-    "number": lambda: RegexFormat(
-        pattern=r"-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
-    ),
-    "boolean": lambda: OrFormat(
-        elements=[ConstStringFormat(value="true"), ConstStringFormat(value="false")]
-    ),
-    "null": lambda: ConstStringFormat(value="null"),
-}
+# False is the only setting that enforces required keys and uniqueness. It also
+# pins the property order to the fork's ``dictsort`` order, which is the order
+# the chat template lists the parameters in, so it is the order the model emits.
+_GEMMA4_ANY_ORDER = False
 
 
-def _gemma4_string_content(prop: dict[str, Any]) -> Any:
-    """Grammar for one raw string value between ``<|"|>`` delimiters.
-
-    An enum/const of strings is enforced exactly (enum semantics are
-    exclusive, so this never over-rejects). Any other string stays
-    permissive, minus the string delimiter and the tool-call markers,
-    which would desync the parser.
-    """
-    enum_values = prop.get("enum")
-    if enum_values is None and isinstance(prop.get("const"), str):
-        enum_values = [prop["const"]]
-    if (
-        isinstance(enum_values, list)
-        and enum_values
-        and len(enum_values) <= 256
-        and all(isinstance(v, str) for v in enum_values)
-        and not any(
-            _GEMMA4_STRING_DELIM in v
-            or _GEMMA4_TOOL_CALL_START in v
-            or _GEMMA4_TOOL_CALL_END in v
-            for v in enum_values
-        )
-    ):
-        branches = [ConstStringFormat(value=v) for v in enum_values]
-        return branches[0] if len(branches) == 1 else OrFormat(elements=branches)
-    return AnyTextFormat(
-        excludes=[
-            _GEMMA4_STRING_DELIM,
-            _GEMMA4_TOOL_CALL_START,
-            _GEMMA4_TOOL_CALL_END,
-        ]
+def _gemma4_syntax_only_tag(name: str) -> TagFormat:
+    # No schema is applied here, so without these literal braces the model
+    # could emit a bare call name that the parser would read as a call with
+    # no arguments.
+    return TagFormat(
+        begin=f"{_GEMMA4_TOOL_CALL_START}call:{name}{{",
+        content=AnyTextFormat(
+            excludes=[_GEMMA4_TOOL_CALL_START, _GEMMA4_TOOL_CALL_END]
+        ),
+        end="}" + _GEMMA4_TOOL_CALL_END,
     )
 
 
-def _gemma4_argument_format(key: str, schema: dict[str, Any]) -> Any | None:
-    """One ``key:value`` pair, or None when the type is not scalar."""
-    prop = schema if isinstance(schema, dict) else {}
-    json_type = prop.get("type")
-    if json_type == "string":
-        return TagFormat(
-            begin=f"{key}:{_GEMMA4_STRING_DELIM}",
-            content=_gemma4_string_content(prop),
-            end=_GEMMA4_STRING_DELIM,
-        )
-    factory = (
-        _GEMMA4_SCALAR_VALUE_FORMATS.get(json_type)
-        if isinstance(json_type, str)
-        else None
-    )
-    if factory is None:
-        return None
-    return SequenceFormat(elements=[ConstStringFormat(value=f"{key}:"), factory()])
-
-
-def _gemma4_arguments_block(parameters: dict[str, Any] | bool) -> Any:
-    """Build the argument block between ``call:NAME{`` and ``}``.
-
-    A bare object/array value has no unambiguous terminator in the non-JSON
-    syntax (nested ``}``), so one non-scalar property degrades the whole
-    tool's block to permissive text bounded by the call markers instead of
-    over-rejecting. Keys stay order-agnostic and non-unique, mirroring the
-    K3 builder's argument semantics.
-    """
-    permissive = AnyTextFormat(
-        excludes=[_GEMMA4_TOOL_CALL_START, _GEMMA4_TOOL_CALL_END]
-    )
-    if not isinstance(parameters, dict):
-        return permissive
-    props = parameters.get("properties")
-    if not isinstance(props, dict) or not props:
-        return permissive
-    arg_formats = []
-    for key, prop in props.items():
-        fmt = _gemma4_argument_format(key, prop)
-        if fmt is None:
-            return permissive
-        arg_formats.append(fmt)
-    one_arg = (
-        arg_formats[0] if len(arg_formats) == 1 else OrFormat(elements=arg_formats)
-    )
-    args_list = SequenceFormat(
-        elements=[
-            one_arg,
-            StarFormat(
-                content=SequenceFormat(
-                    elements=[ConstStringFormat(value=","), one_arg]
+@functools.lru_cache(maxsize=256)
+def _gemma4_schema_compiles(name: str, schema_json: str) -> bool:
+    # The style raises on a shape it cannot express: patternProperties,
+    # propertyNames, a property key that is not an identifier, an invalid
+    # pattern. That reaches the caller as an HTTP 400 on every request
+    # carrying the tool, so probe the schema here and degrade to the
+    # syntax-only tag instead.
+    try:
+        Grammar.from_structural_tag(
+            StructuralTag(
+                format=JSONSchemaFormat(
+                    json_schema=json.loads(schema_json),
+                    style="gemma",
+                    any_order=_GEMMA4_ANY_ORDER,
                 )
-            ),
-        ]
-    )
-    required = parameters.get("required")
-    if isinstance(required, list) and required:
-        return args_list
-    return OptionalFormat(content=args_list)
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "Gemma4 cannot constrain the parameters of tool %s (%s); "
+            "its arguments stay unconstrained.",
+            name,
+            " ".join(str(exc).split()),
+        )
+        return False
+    return True
 
 
 def _gemma4_call_tag(tool: FunctionToolParam) -> TagFormat:
     function = tool.function
+    params = get_function_parameters(function)
+    if not isinstance(params, dict) or params.get("type") != "object":
+        # When strict is False, there are no parameters, or the schema does
+        # not declare an object, constrain the syntax only.
+        return _gemma4_syntax_only_tag(function.name)
+    if not _gemma4_schema_compiles(function.name, json.dumps(params, sort_keys=True)):
+        return _gemma4_syntax_only_tag(function.name)
     return TagFormat(
-        begin=f"{_GEMMA4_TOOL_CALL_START}call:{function.name}{{",
-        content=_gemma4_arguments_block(get_function_parameters(function)),
-        end="}" + _GEMMA4_TOOL_CALL_END,
+        begin=f"{_GEMMA4_TOOL_CALL_START}call:{function.name}",
+        content=JSONSchemaFormat(
+            json_schema=params, style="gemma", any_order=_GEMMA4_ANY_ORDER
+        ),
+        end=_GEMMA4_TOOL_CALL_END,
     )
 
 
