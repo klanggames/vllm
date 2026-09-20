@@ -70,7 +70,8 @@ XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
         "deepseek_v4",
     }
 )
-VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset({"hermes", "kimi_k3"})
+# "gemma4" is a Klang patch, not upstream.
+VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset({"hermes", "kimi_k3", "gemma4"})
 SUPPORTED_STRUCTURAL_TAG_MODELS = (
     XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS | VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
 )
@@ -604,4 +605,181 @@ def get_kimi_k3_structural_tag(
 
     return StructuralTag(
         format=SequenceFormat(elements=[*_k3_response_prefix(), tools_part, trailer])
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 (native ``<|tool_call>call:...`` format). Klang patch, not upstream.
+# ---------------------------------------------------------------------------
+# Gemma4 assistant tool calls (see ``vllm/parser/gemma4.py``):
+#   <|tool_call>call:NAME{key:<|"|>string val<|"|>,count:42,flag:true}<tool_call|>
+# Multiple calls are emitted back-to-back with no separator. Strings are
+# wrapped in the ``<|"|>`` delimiter token and emitted raw; numbers, booleans
+# and null are emitted bare. The argument block is NOT JSON, so
+# JSONSchemaFormat cannot express it.
+_GEMMA4_TOOL_CALL_START = "<|tool_call>"
+_GEMMA4_TOOL_CALL_END = "<tool_call|>"
+_GEMMA4_STRING_DELIM = '<|"|>'
+# The proper post-call terminator. Some checkpoints emit EOS directly
+# instead, so the trailer is optional.
+_GEMMA4_TOOL_RESPONSE = "<|tool_response>"
+
+_GEMMA4_SCALAR_VALUE_FORMATS: dict[str, Callable[[], Any]] = {
+    "integer": lambda: RegexFormat(pattern=r"-?[0-9]+"),
+    "number": lambda: RegexFormat(
+        pattern=r"-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+    ),
+    "boolean": lambda: OrFormat(
+        elements=[ConstStringFormat(value="true"), ConstStringFormat(value="false")]
+    ),
+    "null": lambda: ConstStringFormat(value="null"),
+}
+
+
+def _gemma4_string_content(prop: dict[str, Any]) -> Any:
+    """Grammar for one raw string value between ``<|"|>`` delimiters.
+
+    An enum/const of strings is enforced exactly (enum semantics are
+    exclusive, so this never over-rejects). Any other string stays
+    permissive, minus the string delimiter and the tool-call markers,
+    which would desync the parser.
+    """
+    enum_values = prop.get("enum")
+    if enum_values is None and isinstance(prop.get("const"), str):
+        enum_values = [prop["const"]]
+    if (
+        isinstance(enum_values, list)
+        and enum_values
+        and len(enum_values) <= 256
+        and all(isinstance(v, str) for v in enum_values)
+        and not any(
+            _GEMMA4_STRING_DELIM in v
+            or _GEMMA4_TOOL_CALL_START in v
+            or _GEMMA4_TOOL_CALL_END in v
+            for v in enum_values
+        )
+    ):
+        branches = [ConstStringFormat(value=v) for v in enum_values]
+        return branches[0] if len(branches) == 1 else OrFormat(elements=branches)
+    return AnyTextFormat(
+        excludes=[
+            _GEMMA4_STRING_DELIM,
+            _GEMMA4_TOOL_CALL_START,
+            _GEMMA4_TOOL_CALL_END,
+        ]
+    )
+
+
+def _gemma4_argument_format(key: str, schema: dict[str, Any]) -> Any | None:
+    """One ``key:value`` pair, or None when the type is not scalar."""
+    prop = schema if isinstance(schema, dict) else {}
+    json_type = prop.get("type")
+    if json_type == "string":
+        return TagFormat(
+            begin=f"{key}:{_GEMMA4_STRING_DELIM}",
+            content=_gemma4_string_content(prop),
+            end=_GEMMA4_STRING_DELIM,
+        )
+    factory = (
+        _GEMMA4_SCALAR_VALUE_FORMATS.get(json_type)
+        if isinstance(json_type, str)
+        else None
+    )
+    if factory is None:
+        return None
+    return SequenceFormat(elements=[ConstStringFormat(value=f"{key}:"), factory()])
+
+
+def _gemma4_arguments_block(parameters: dict[str, Any] | bool) -> Any:
+    """Build the argument block between ``call:NAME{`` and ``}``.
+
+    A bare object/array value has no unambiguous terminator in the non-JSON
+    syntax (nested ``}``), so one non-scalar property degrades the whole
+    tool's block to permissive text bounded by the call markers instead of
+    over-rejecting. Keys stay order-agnostic and non-unique, mirroring the
+    K3 builder's argument semantics.
+    """
+    permissive = AnyTextFormat(
+        excludes=[_GEMMA4_TOOL_CALL_START, _GEMMA4_TOOL_CALL_END]
+    )
+    if not isinstance(parameters, dict):
+        return permissive
+    props = parameters.get("properties")
+    if not isinstance(props, dict) or not props:
+        return permissive
+    arg_formats = []
+    for key, prop in props.items():
+        fmt = _gemma4_argument_format(key, prop)
+        if fmt is None:
+            return permissive
+        arg_formats.append(fmt)
+    one_arg = (
+        arg_formats[0] if len(arg_formats) == 1 else OrFormat(elements=arg_formats)
+    )
+    args_list = SequenceFormat(
+        elements=[
+            one_arg,
+            StarFormat(
+                content=SequenceFormat(
+                    elements=[ConstStringFormat(value=","), one_arg]
+                )
+            ),
+        ]
+    )
+    required = parameters.get("required")
+    if isinstance(required, list) and required:
+        return args_list
+    return OptionalFormat(content=args_list)
+
+
+def _gemma4_call_tag(tool: FunctionToolParam) -> TagFormat:
+    function = tool.function
+    return TagFormat(
+        begin=f"{_GEMMA4_TOOL_CALL_START}call:{function.name}{{",
+        content=_gemma4_arguments_block(get_function_parameters(function)),
+        end="}" + _GEMMA4_TOOL_CALL_END,
+    )
+
+
+@register_vllm_structural_tag("gemma4")
+def get_gemma4_structural_tag(
+    tools: list[FunctionToolParam],
+    builtin_tools: list[BuiltinToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+) -> StructuralTag:
+    del builtin_tools, reasoning
+
+    call_tags = [_gemma4_call_tag(tool) for tool in tools]
+
+    if tool_choice == "auto":
+        suffix_tag: Any = (
+            TriggeredTagsFormat(triggers=[_GEMMA4_TOOL_CALL_START], tags=call_tags)
+            if call_tags
+            else AnyTextFormat()
+        )
+        return StructuralTag(format=suffix_tag)
+
+    if not call_tags:
+        return StructuralTag(format=AnyTextFormat())
+
+    calls = TagsWithSeparatorFormat(
+        tags=call_tags,
+        separator="",
+        at_least_one=True,
+        stop_after_first=(tool_choice == "forced"),
+    )
+    # The first constrained token must already open a call. The engine
+    # applies the grammar only after the reasoning block ends (see
+    # ``vllm/v1/structured_output/__init__.py``), so a thought prefix needs
+    # no allowance here. A free-text preamble must not be allowed: with EOS
+    # masked, the model can then write text until ``max_tokens`` and never
+    # start a call.
+    return StructuralTag(
+        format=SequenceFormat(
+            elements=[
+                calls,
+                OptionalFormat(content=ConstStringFormat(value=_GEMMA4_TOOL_RESPONSE)),
+            ]
+        )
     )
