@@ -305,11 +305,15 @@ def gemma4_config() -> ParserEngineConfig:
             "CALL_PREFIX": "call:",
             "OPEN_BRACE": "{",
         },
+        # Klang patch: TOOL_START and TOOL_END are text terminals only. With
+        # a token id registered, the engine demotes text matches of these
+        # markers to content when the stream has token ids (see ``strict`` in
+        # ``streaming_parser_engine.py``). The structural tag forces the
+        # markers as text, and xgrammar lets the model spell them with
+        # regular tokens, so id-only matching drops the forced calls.
         token_id_terminals={
             "THINK_START": CHANNEL_START,
             "THINK_END": CHANNEL_END,
-            "TOOL_START": TOOL_CALL_START,
-            "TOOL_END": TOOL_CALL_END,
         },
         transitions={
             # -- Reasoning transitions --
@@ -380,6 +384,68 @@ def gemma4_config() -> ParserEngineConfig:
     )
 
 
+# Klang patch (not upstream): apply the gemma4 structural tag on the unified
+# engine path. When the reasoning parser and the tool parser are both
+# ``gemma4``, ``ParserManager.get_parser`` returns this engine directly, so
+# ``DelegatingParser._apply_structural_tag`` never runs and required/named
+# tool choice is not enforced (vllm-project/vllm#50477, #53363).
+# The hook also fires when gemma4 is only the reasoning parser, because the
+# reasoning adapter delegates ``adjust_request`` to this engine. That
+# attaches the gemma4 grammar for a different tool parser, so do not run
+# this image with ``--reasoning-parser gemma4`` and another tool parser.
+def _apply_gemma4_structural_tag(
+    request: ChatCompletionRequest | ResponsesRequest,
+) -> ChatCompletionRequest | ResponsesRequest:
+    import vllm.envs as envs
+
+    if not envs.VLLM_ENFORCE_STRICT_TOOL_CALLING or not getattr(
+        request, "tools", None
+    ):
+        return request
+
+    from openai.types.responses import ToolChoiceFunction
+
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionNamedToolChoiceParam,
+    )
+
+    tool_choice = getattr(request, "tool_choice", None)
+    if not (
+        tool_choice in ("auto", "required")
+        or isinstance(
+            tool_choice, (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction)
+        )
+    ):
+        return request
+
+    structured_outputs = getattr(request, "structured_outputs", None)
+    if structured_outputs is not None and structured_outputs.structural_tag is not None:
+        return request
+
+    from vllm.tool_parsers.structural_tag_registry import get_model_structural_tag
+
+    structure_tag = get_model_structural_tag(
+        model="gemma4",
+        tools=request.tools,
+        tool_choice=tool_choice,
+        reasoning=False,
+    )
+    if structure_tag is None:
+        return request
+
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+    from vllm.sampling_params import StructuredOutputsParams
+
+    request.structured_outputs = StructuredOutputsParams(
+        structural_tag=json.dumps(structure_tag.model_dump())
+    )
+    if isinstance(request, ResponsesRequest):
+        request.text = None
+    else:
+        request.response_format = None
+    return request
+
+
 _GEMMA4_THOUGHT_PREFIX = "thought\n"
 _GEMMA4_THOUGHT_TOKEN = "thought"
 
@@ -420,6 +486,12 @@ class Gemma4Parser(ParserEngine):
         self._reasoning_text = ""
         self._prefix_stripped = False
         self._is_first_feed = True
+
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        request = _apply_gemma4_structural_tag(request)
+        return super().adjust_request(request)
 
     def _preprocess_feed(
         self,
