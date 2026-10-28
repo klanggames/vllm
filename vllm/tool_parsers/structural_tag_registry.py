@@ -1178,18 +1178,50 @@ def get_glm_4_7_structural_tag(
 #   <|tool_call>call:NAME{key:<|"|>string val<|"|>,count:42,flag:true}<tool_call|>
 # Multiple calls are emitted back-to-back with no separator. The argument block
 # is JSON-shaped but not JSON: keys are bare and string values are wrapped in
-# the ``<|"|>`` delimiter token and emitted raw, without escapes. The Klang
-# xgrammar fork expresses that shape as the ``gemma`` JSON-schema style, so the
-# tool's parameters schema constrains the whole block, its braces included.
+# the ``<|"|>`` delimiter token and emitted raw, without escapes. xgrammar
+# expresses that shape as the ``gemma`` JSON-schema style, so the tool's
+# parameters schema constrains the whole block, its braces included.
 _GEMMA4_TOOL_CALL_START = "<|tool_call>"
 _GEMMA4_TOOL_CALL_END = "<tool_call|>"
 # The proper post-call terminator. Some checkpoints emit EOS directly
 # instead, so the trailer is optional.
 _GEMMA4_TOOL_RESPONSE = "<|tool_response>"
 # False is the only setting that enforces required keys and uniqueness. It also
-# pins the property order to the fork's ``dictsort`` order, which is the order
-# the chat template lists the parameters in, so it is the order the model emits.
+# pins the property order to the schema's order, which
+# ``_gemma4_dictsort_schema`` sets to the chat template's ``dictsort`` order,
+# the order the model emits.
 _GEMMA4_ANY_ORDER = False
+
+
+def _gemma4_dictsort(mapping: dict[str, Any], value: Callable[[Any], Any]) -> dict:
+    return {
+        key: value(item)
+        for key, item in sorted(mapping.items(), key=lambda kv: kv[0].lower())
+    }
+
+
+def _gemma4_dictsort_literal(literal: Any) -> Any:
+    if isinstance(literal, dict):
+        return _gemma4_dictsort(literal, _gemma4_dictsort_literal)
+    if isinstance(literal, list):
+        return [_gemma4_dictsort_literal(item) for item in literal]
+    return literal
+
+
+def _gemma4_dictsort_schema(schema: Any) -> Any:
+    if isinstance(schema, list):
+        return [_gemma4_dictsort_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    sorted_schema = {}
+    for key, item in schema.items():
+        if key == "properties" and isinstance(item, dict):
+            sorted_schema[key] = _gemma4_dictsort(item, _gemma4_dictsort_schema)
+        elif key in ("const", "enum", "default", "examples"):
+            sorted_schema[key] = _gemma4_dictsort_literal(item)
+        else:
+            sorted_schema[key] = _gemma4_dictsort_schema(item)
+    return sorted_schema
 
 
 def _gemma4_syntax_only_tag(name: str) -> TagFormat:
@@ -1240,6 +1272,7 @@ def _gemma4_call_tag(tool: FunctionToolParam) -> TagFormat:
         # When strict is False, there are no parameters, or the schema does
         # not declare an object, constrain the syntax only.
         return _gemma4_syntax_only_tag(function.name)
+    params = _gemma4_dictsort_schema(params)
     if not _gemma4_schema_compiles(function.name, json.dumps(params, sort_keys=True)):
         return _gemma4_syntax_only_tag(function.name)
     return TagFormat(

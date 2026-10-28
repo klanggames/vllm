@@ -4,9 +4,9 @@
 # Klang tests for the gemma4 structural-tag patch (vllm-project/vllm#50477,
 # #53363). They follow the kimi_k3 tests in
 # ``tests/tool_parsers/test_structural_tag_registry.py``. They fail on stock
-# vLLM v0.28.0 and pass with the patch applied. The argument grammar needs the
-# ``gemma`` JSON-schema style, which only the Klang xgrammar fork has (see the
-# README).
+# vLLM v0.32.0 and pass with the patch applied. The argument grammar needs the
+# ``gemma`` JSON-schema style from mlc-ai/xgrammar#923, not yet in a release
+# (see the README).
 
 from typing import Any
 
@@ -326,6 +326,25 @@ def test_gemma4_seed_tool_declared_out_of_sorted_order():
     )
     assert _accepts(tool, 'perception_updates:[<|"|>p<|"|>],summary:<|"|>s<|"|>')
     assert not _accepts(tool, 'summary:<|"|>s<|"|>,perception_updates:[<|"|>p<|"|>]')
+
+
+def test_gemma4_nested_properties_follow_the_sorted_order():
+    tool = _tool(
+        "plan_route",
+        {
+            "route": {
+                "type": "object",
+                "properties": {
+                    "Zone": {"type": "string"},
+                    "alpha": {"type": "integer"},
+                },
+                "required": ["Zone", "alpha"],
+            }
+        },
+        ["route"],
+    )
+    assert _accepts(tool, 'route:{alpha:1,Zone:<|"|>z<|"|>}')
+    assert not _accepts(tool, 'route:{Zone:<|"|>z<|"|>,alpha:1}')
 
 
 def test_gemma4_string_value_rejects_the_call_markers():
