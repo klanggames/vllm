@@ -217,6 +217,8 @@ def get_model_structural_tag(
     tools = get_structural_tag_tools(model, tools, tool_choice)
     if not tools:
         return None
+    if model == "gemma4":
+        tools = _gemma4_strict_by_default(tools, tool_choice)
     tools = resolve_tool_strictness(tools, tool_choice, strict_level)
     if tools is None:
         return None
@@ -1235,6 +1237,26 @@ def _gemma4_syntax_only_tag(name: str) -> TagFormat:
         ),
         end="}" + _GEMMA4_TOOL_CALL_END,
     )
+
+
+def _gemma4_strict_by_default(
+    tools: Sequence[ChatCompletionToolsParam | ResponsesTool],
+    tool_choice: ToolChoice,
+) -> Sequence[ChatCompletionToolsParam | ResponsesTool]:
+    if tool_choice == "auto" and not _any_tool_strict(tools):
+        return tools
+    return [
+        _with_tool_strict(tool, True) if _tool_strict_unset(tool) else tool
+        for tool in tools
+    ]
+
+
+def _tool_strict_unset(tool: ChatCompletionToolsParam | ResponsesTool) -> bool:
+    if isinstance(tool, FunctionTool):
+        return tool.strict is None
+    if isinstance(tool, ChatCompletionToolsParam):
+        return tool.function.strict is None
+    return False
 
 
 @functools.lru_cache(maxsize=256)
