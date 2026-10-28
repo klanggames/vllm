@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 from xgrammar import Grammar, StructuralTag
-from xgrammar.structural_tag import AnyTextFormat, JSONSchemaFormat, TagFormat
+from xgrammar.structural_tag import JSONSchemaFormat, TagFormat
 from xgrammar.testing import _is_grammar_accept_string
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
