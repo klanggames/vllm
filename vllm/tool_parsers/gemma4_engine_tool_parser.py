@@ -13,6 +13,10 @@ from vllm.parser.engine.registered_adapters import Gemma4ParserToolAdapter
 
 class Gemma4EngineToolParser(Gemma4ParserToolAdapter):  # type: ignore[valid-type, misc]
     supports_required_and_named = False
+    # Klang patch (not upstream): let ``DelegatingParser._apply_structural_tag``
+    # constrain decoding to the native format for required/named tool choice
+    # (vllm-project/vllm#50477, #53363).
+    structural_tag_model = "gemma4"
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest

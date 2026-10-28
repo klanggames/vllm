@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import functools
 import json
 from collections.abc import Callable, Sequence
 from typing import Any, Literal, TypeAlias
@@ -12,7 +13,7 @@ from openai.types.responses.tool import Tool as ResponsesTool
 from openai.types.responses.tool_choice_allowed import ToolChoiceAllowed
 from openai.types.responses.tool_choice_function import ToolChoiceFunction
 from pydantic import BaseModel
-from xgrammar import StructuralTag, normalize_tool_choice
+from xgrammar import Grammar, StructuralTag, normalize_tool_choice
 from xgrammar import get_model_structural_tag as get_xgrammar_model_structural_tag
 from xgrammar.openai_tool_call_schema import (
     BuiltinToolParam,
@@ -38,12 +39,15 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
 )
+from vllm.logger import init_logger
 from vllm.tool_parsers.tool_strict_level import ToolStrictLevel
 from vllm.tool_parsers.utils import (
     custom_tool_parameters,
     get_function_tools,
     require_function_tools,
 )
+
+logger = init_logger(__name__)
 
 ToolChoice: TypeAlias = (
     Literal["none", "auto", "required"]
@@ -82,8 +86,9 @@ XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
         "deepseek_v4_1",
     }
 )
+# "gemma4" is a Klang patch, not upstream.
 VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
-    {"glm_4_7", "hermes", "hy_v4", "kimi_k3", "longcat", "plamo3"}
+    {"gemma4", "glm_4_7", "hermes", "hy_v4", "kimi_k3", "longcat", "plamo3"}
 )
 SUPPORTED_STRUCTURAL_TAG_MODELS = (
     XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS | VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
@@ -212,6 +217,8 @@ def get_model_structural_tag(
     tools = get_structural_tag_tools(model, tools, tool_choice)
     if not tools:
         return None
+    if model == "gemma4":
+        tools = _gemma4_strict_by_default(tools, tool_choice)
     tools = resolve_tool_strictness(tools, tool_choice, strict_level)
     if tools is None:
         return None
@@ -1164,3 +1171,186 @@ def get_glm_4_7_structural_tag(
         )
         return StructuralTag(format=SequenceFormat(elements=[prefix_tag, suffix_tag]))
     return StructuralTag(format=suffix_tag)
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 (native ``<|tool_call>call:...`` format)
+# ---------------------------------------------------------------------------
+# Gemma4 assistant tool calls (see ``vllm/parser/gemma4.py``):
+#   <|tool_call>call:NAME{key:<|"|>string val<|"|>,count:42,flag:true}<tool_call|>
+# Multiple calls are emitted back-to-back with no separator. The argument block
+# is JSON-shaped but not JSON: keys are bare and string values are wrapped in
+# the ``<|"|>`` delimiter token and emitted raw, without escapes. xgrammar
+# expresses that shape as the ``gemma`` JSON-schema style, so the tool's
+# parameters schema constrains the whole block, its braces included.
+_GEMMA4_TOOL_CALL_START = "<|tool_call>"
+_GEMMA4_TOOL_CALL_END = "<tool_call|>"
+# The proper post-call terminator. Some checkpoints emit EOS directly
+# instead, so the trailer is optional.
+_GEMMA4_TOOL_RESPONSE = "<|tool_response>"
+# False is the only setting that enforces required keys and uniqueness. It also
+# pins the property order to the schema's order, which
+# ``_gemma4_dictsort_schema`` sets to the chat template's ``dictsort`` order,
+# the order the model emits.
+_GEMMA4_ANY_ORDER = False
+_GEMMA4_ARGUMENT_EXCLUDES = [_GEMMA4_TOOL_CALL_START, _GEMMA4_TOOL_CALL_END]
+
+
+def _gemma4_dictsort(mapping: dict[str, Any], value: Callable[[Any], Any]) -> dict:
+    return {
+        key: value(item)
+        for key, item in sorted(mapping.items(), key=lambda kv: kv[0].lower())
+    }
+
+
+def _gemma4_dictsort_literal(literal: Any) -> Any:
+    if isinstance(literal, dict):
+        return _gemma4_dictsort(literal, _gemma4_dictsort_literal)
+    if isinstance(literal, list):
+        return [_gemma4_dictsort_literal(item) for item in literal]
+    return literal
+
+
+def _gemma4_dictsort_schema(schema: Any) -> Any:
+    if isinstance(schema, list):
+        return [_gemma4_dictsort_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    sorted_schema = {}
+    for key, item in schema.items():
+        if key == "properties" and isinstance(item, dict):
+            sorted_schema[key] = _gemma4_dictsort(item, _gemma4_dictsort_schema)
+        elif key in ("const", "enum", "default", "examples"):
+            sorted_schema[key] = _gemma4_dictsort_literal(item)
+        else:
+            sorted_schema[key] = _gemma4_dictsort_schema(item)
+    return sorted_schema
+
+
+def _gemma4_syntax_only_tag(name: str) -> TagFormat:
+    # No schema is applied here, so without these literal braces the model
+    # could emit a bare call name that the parser would read as a call with
+    # no arguments.
+    return TagFormat(
+        begin=f"{_GEMMA4_TOOL_CALL_START}call:{name}{{",
+        content=AnyTextFormat(
+            excludes=[_GEMMA4_TOOL_CALL_START, _GEMMA4_TOOL_CALL_END]
+        ),
+        end="}" + _GEMMA4_TOOL_CALL_END,
+    )
+
+
+def _gemma4_strict_by_default(
+    tools: Sequence[ChatCompletionToolsParam | ResponsesTool],
+    tool_choice: ToolChoice,
+) -> Sequence[ChatCompletionToolsParam | ResponsesTool]:
+    if tool_choice == "auto" and not _any_tool_strict(tools):
+        return tools
+    return [
+        _with_tool_strict(tool, True) if _tool_strict_unset(tool) else tool
+        for tool in tools
+    ]
+
+
+def _tool_strict_unset(tool: ChatCompletionToolsParam | ResponsesTool) -> bool:
+    if isinstance(tool, FunctionTool):
+        return tool.strict is None
+    if isinstance(tool, ChatCompletionToolsParam):
+        return tool.function.strict is None
+    return False
+
+
+@functools.lru_cache(maxsize=256)
+def _gemma4_schema_compiles(name: str, schema_json: str) -> bool:
+    # The style raises on a shape it cannot express: patternProperties,
+    # propertyNames, a property key that is not an identifier, an invalid
+    # pattern. That reaches the caller as an HTTP 400 on every request
+    # carrying the tool, so probe the schema here and degrade to the
+    # syntax-only tag instead.
+    try:
+        Grammar.from_structural_tag(
+            StructuralTag(
+                format=JSONSchemaFormat(
+                    json_schema=json.loads(schema_json),
+                    style="gemma",
+                    any_order=_GEMMA4_ANY_ORDER,
+                    excludes=_GEMMA4_ARGUMENT_EXCLUDES,
+                )
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "Gemma4 cannot constrain the parameters of tool %s (%s); "
+            "its arguments stay unconstrained.",
+            name,
+            " ".join(str(exc).split()),
+        )
+        return False
+    return True
+
+
+def _gemma4_call_tag(tool: FunctionToolParam) -> TagFormat:
+    function = tool.function
+    params = get_function_parameters(function)
+    if not isinstance(params, dict) or params.get("type") != "object":
+        # When strict is False, there are no parameters, or the schema does
+        # not declare an object, constrain the syntax only.
+        return _gemma4_syntax_only_tag(function.name)
+    params = _gemma4_dictsort_schema(params)
+    if not _gemma4_schema_compiles(function.name, json.dumps(params, sort_keys=True)):
+        return _gemma4_syntax_only_tag(function.name)
+    return TagFormat(
+        begin=f"{_GEMMA4_TOOL_CALL_START}call:{function.name}",
+        content=JSONSchemaFormat(
+            json_schema=params,
+            style="gemma",
+            any_order=_GEMMA4_ANY_ORDER,
+            excludes=_GEMMA4_ARGUMENT_EXCLUDES,
+        ),
+        end=_GEMMA4_TOOL_CALL_END,
+    )
+
+
+@register_vllm_structural_tag("gemma4")
+def get_gemma4_structural_tag(
+    tools: list[FunctionToolParam],
+    builtin_tools: list[BuiltinToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+    token_suffix: str = "",
+) -> StructuralTag:
+    del builtin_tools, reasoning, token_suffix
+
+    call_tags = [_gemma4_call_tag(tool) for tool in tools]
+
+    if tool_choice == "auto":
+        suffix_tag: Any = (
+            TriggeredTagsFormat(triggers=[_GEMMA4_TOOL_CALL_START], tags=call_tags)
+            if call_tags
+            else AnyTextFormat()
+        )
+        return StructuralTag(format=suffix_tag)
+
+    if not call_tags:
+        return StructuralTag(format=AnyTextFormat())
+
+    calls = TagsWithSeparatorFormat(
+        tags=call_tags,
+        separator="",
+        at_least_one=True,
+        stop_after_first=(tool_choice == "forced"),
+    )
+    # The first constrained token must already open a call. The engine
+    # applies the grammar only after the reasoning block ends (see
+    # ``vllm/v1/structured_output/__init__.py``), so a thought prefix needs
+    # no allowance here. A free-text preamble must not be allowed: with EOS
+    # masked, the model can then write text until ``max_tokens`` and never
+    # start a call.
+    return StructuralTag(
+        format=SequenceFormat(
+            elements=[
+                calls,
+                OptionalFormat(content=ConstStringFormat(value=_GEMMA4_TOOL_RESPONSE)),
+            ]
+        )
+    )
