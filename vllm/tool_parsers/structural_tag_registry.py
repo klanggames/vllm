@@ -1193,6 +1193,7 @@ _GEMMA4_TOOL_RESPONSE = "<|tool_response>"
 # ``_gemma4_dictsort_schema`` sets to the chat template's ``dictsort`` order,
 # the order the model emits.
 _GEMMA4_ANY_ORDER = False
+_GEMMA4_ARGUMENT_EXCLUDES = [_GEMMA4_TOOL_CALL_START, _GEMMA4_TOOL_CALL_END]
 
 
 def _gemma4_dictsort(mapping: dict[str, Any], value: Callable[[Any], Any]) -> dict:
@@ -1273,6 +1274,7 @@ def _gemma4_schema_compiles(name: str, schema_json: str) -> bool:
                     json_schema=json.loads(schema_json),
                     style="gemma",
                     any_order=_GEMMA4_ANY_ORDER,
+                    excludes=_GEMMA4_ARGUMENT_EXCLUDES,
                 )
             )
         )
@@ -1300,7 +1302,10 @@ def _gemma4_call_tag(tool: FunctionToolParam) -> TagFormat:
     return TagFormat(
         begin=f"{_GEMMA4_TOOL_CALL_START}call:{function.name}",
         content=JSONSchemaFormat(
-            json_schema=params, style="gemma", any_order=_GEMMA4_ANY_ORDER
+            json_schema=params,
+            style="gemma",
+            any_order=_GEMMA4_ANY_ORDER,
+            excludes=_GEMMA4_ARGUMENT_EXCLUDES,
         ),
         end=_GEMMA4_TOOL_CALL_END,
     )

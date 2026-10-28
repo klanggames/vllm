@@ -252,7 +252,7 @@ def test_gemma4_unconstrainable_parameters_still_force_the_syntax(function: dict
         ),
     ],
 )
-def test_gemma4_schema_the_style_rejects_falls_back_to_syntax_only(
+def test_gemma4_schema_with_bare_key_patterns_stays_constrained(
     parameters: dict, monkeypatch
 ):
     monkeypatch.setenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "1")
@@ -260,8 +260,8 @@ def test_gemma4_schema_the_style_rejects_falls_back_to_syntax_only(
         type="function", function={"name": "book_room", "parameters": parameters}
     )
     (call_tag,) = _call_tags([tool])
-    assert call_tag.begin == "<|tool_call>call:book_room{"
-    assert isinstance(call_tag.content, AnyTextFormat)
+    assert call_tag.begin == "<|tool_call>call:book_room"
+    assert isinstance(call_tag.content, JSONSchemaFormat)
 
     parser = Gemma4Parser(_DummyTokenizer())
     request = parser.adjust_request(_request("required", [tool]))
